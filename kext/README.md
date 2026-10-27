@@ -1,8 +1,11 @@
 # kext: карта классов и что нужно проверить на железе
 
-> Это дизайн-карта, а не готовый Xcode-проект. Код актуатора пишется после этапа 0
-> (замеры) и после проверки API на конкретной сборке macOS. Всё, что ниже, — контракт
-> ответственности, а не «скомпилируется как есть».
+> Это дизайн-карта актуатора. **Что уже есть в коде (v0.1, `Source/`)**: read-only сервис
+> `com_illia_RyzenPlatform` — CPPC/P-state/APERF/MPERF/TSC по каждому CPU и Tctl через SMN,
+> публикация в IORegistry, boot-arg kill switch. Классы `RyzenCPPC`, `RyzenWatchdog`,
+> `RyzenUserClient` и запись в MSR — ещё нет; они пишутся после этапа 0 (замеры) и после
+> проверки API на конкретной сборке macOS. Ниже — контракт ответственности, а не
+> «скомпилируется как есть».
 
 ## Зачем вообще kext
 
@@ -11,11 +14,11 @@
 
 ## Классы
 
-### `RyzenPlatformPlugin : IOService`
+### `com_illia_RyzenPlatform : IOService` (в дизайне — «RyzenPlatformPlugin»)
 
 - `start(IOService *provider)`:
-  - проверить boot arg `-ryzenpmoff` (через `PE_parse_boot_argn`; проверить доступность в
-    целевом SDK);
+  - проверить boot arg `ryzenplatform=0` / `-ryzenpmoff` (через `PE_parse_boot_argn`; в v0.1
+    уже сделано);
   - проверить CPU: Family 19h, Model 50h (Cezanne). Если не совпало — лог и `return false`;
   - найти host bridge / root complex для SMN (позже — для сенсоров);
   - прочитать CPPC caps, проверить support/enable;
@@ -47,14 +50,19 @@
   - `MSR_AMD_CPPC_ENABLE` bit 0; проверить `CPPC_STATUS`.
 
 **Критично:** MSR — per-core. Нельзя писать «в среднем по больнице». Нужен rendezvous на
-каждый CPU (`mp_rendezvous_no_intrs` или аналог; проверить, что экспортируется и не запрещён
-на целевой macOS). Если API недоступен — искать другой путь, а не писать с чужого ядра.
+каждый CPU. Для **чтения раз в секунду** v0.1 использует `mp_rendezvous_no_intrs`. Для записи
+он не годится: останавливает все ядра ради одного и на частых записях сам даёт микролаги.
+Нужен таргетный вызов на один CPU (семейство `mp_cpus_call`; проверить, что экспортируется).
+Если API недоступен — искать другой путь, а не писать с чужого ядра.
 
 ### `RyzenSensors` (v0.1 — опционально, fallback)
 
 - SMN read через root complex (config space 0x60/0x64 — как в Linux `amd_nb.c`; проверить
   device/offset на конкретной машине).
-- Температура Cezanne: смещение брать из `k10temp`/`SMCAMDProcessor`, не угадывать.
+- Температура Cezanne: смещение брать из `k10temp`/`SMCAMDProcessor`, не угадывать. Бит 19
+  (`CUR_TEMP_RANGE_SEL`, −49 °C) в v0.1 учтён; сырой регистр публикуется для сверки.
+- SMN index/data — не атомарная пара и делится с другими kext'ами: свои вызовы под локом,
+  чужое вмешательство ловится повторным чтением индекса (`smn.retries`).
 - Package power: если есть MSR/DFLL-путь — использовать; иначе `IOReport`/`pmset` в демоне.
 - Все чтения — с таймаутом и проверкой валидности; «мусор» не должен попадать в thermal guard.
 
@@ -77,12 +85,12 @@
 
 ## Info.plist (что проверить)
 
-- `CFBundleIdentifier`: `com.example.RyzenPlatformPlugin` (заменить на свой).
+- `CFBundleIdentifier`: `com.illia.RyzenPlatform` (уже выставлен).
 - `OSBundleLibraries`: `com.apple.kpi.iokit`, `com.apple.kpi.libkern`, `com.apple.kpi.mach`,
   `com.apple.kpi.bsd`; добавить `com.apple.kpi.unsupported`, если нужен `mp_rendezvous`.
 - `IOKitPersonalities`:
   - v0.1: сервисный kext на `IOResources` (`IOProviderClass = IOResources`,
-    `IOClass = RyzenPlatformPlugin`, `IOProbeScore = 1000`);
+    `IOClass = com_illia_RyzenPlatform`);
   - host bridge ищем сами через `IOPCIDevice` (vendor `0x1022`, class `0x060000`).
   - Альтернатива — матчиться на `pci1022,14b5`/конкретный host bridge, но это привязывает
     kext к одной модели. Начать с `IOResources` + runtime-поиск.
@@ -95,19 +103,19 @@
 - `ARCHS = x86_64`, `MACOSX_DEPLOYMENT_TARGET` = версия macOS.
 - Локально: SIP off, AMFI off, kext signing off (OpenCore `csr-active-config`, `amfi=0x80`).
 - Подпись/notarization — вне v0.1.
-- Всегда держать запасной EFI на USB и boot arg `-ryzenpmoff`.
+- Всегда держать запасной EFI на USB и boot arg `ryzenplatform=0` (или `-ryzenpmoff`).
 
 ## TODO / reverse-engineer
 
 - [ ] Точный `newUserClient` signature в целевом SDK.
-- [ ] Доступность `mp_rendezvous_no_intrs`/`ml_*` для per-CPU MSR.
+- [ ] Таргетный вызов на один CPU для записи (`mp_cpus_call` и родня): экспортируется ли.
 - [ ] CPPC caps на Cezanne: реальные `lowest/nominal/highest perf` и частоты.
 - [ ] `CPPC_REQ` layout: проверить биты на живой машине (Linux `amd_pstate` — референс).
 - [ ] `CPPC_ENABLE`: кто его включает — firmware, kext, macOS? Не отбирать управление у SMU
       вслепую.
 - [ ] SMN offsets для temp/power именно Cezanne (не Renoir, не Vermeer).
 - [ ] Sleep/wake notifications: `IOPMrootDomain` vs `registerPowerDriver`.
-- [ ] Boot arg API: `PE_parse_boot_argn` доступен? Если нет — `OSBoolean` из device tree?
+- [x] Boot arg API: `PE_parse_boot_argn` используется в v0.1 (собирается; поведение на железе проверить).
 - [ ] Что делает AMD Vanilla с XCPM на этой сборке: какие MSR уже патчатся/игнорируются.
 - [ ] Не конфликтует ли с `SMCAMDProcessor`/`AMDRyzenCPUPowerManagement` за SMN.
 

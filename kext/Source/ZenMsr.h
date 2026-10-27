@@ -40,10 +40,35 @@
 #define PSTATE_DEF_DID(x)       ((uint32_t)(((x) >> 8)  & 0x3Fu))
 #define PSTATE_DEF_VID(x)       ((uint32_t)(((x) >> 14) & 0x1FFu))
 
+/* ---- Effective-frequency counters (CPUID Fn0000_0006 ECX[0]) ----
+ * MPERF ticks at the reference (P0 / TSC) rate while the core is in C0, APERF
+ * ticks at the actual clock while in C0. So:
+ *   C0 residency  = dMPERF / dTSC
+ *   effective MHz = tsc_MHz * dAPERF / dMPERF
+ * Reading them is free of side effects; this is how we learn whether idle
+ * cores really sleep, before we write a single request. */
+#define MSR_IA32_MPERF         0x000000E7u
+#define MSR_IA32_APERF         0x000000E8u
+
 /* ---- SMN (System Management Network), reached through D0F0 0x60/0x64 ---- */
 #define SMN_THM_TCON_CUR_TMP   0x00059800u  /* bits 31:21 = Tctl in 1/8 C        */
 #define SMN_TCTL_SHIFT         21
 #define SMN_TCTL_MASK          0x7FFu
-#define SMN_TCTL_MDEG(v)       ((uint32_t)(((v) >> SMN_TCTL_SHIFT) & SMN_TCTL_MASK) * 125u)
+/* bit 19 = CUR_TEMP_RANGE_SEL: when set the reading is offset by -49 C (the
+ * same rule Linux k10temp applies). Not handling it would report a hot chip as
+ * 49 C too warm. The raw register is published too, to check this on hardware. */
+#define SMN_TCTL_RANGE_SEL     (1u << 19)
+#define SMN_TCTL_RANGE_MDEG    49000
+
+/* Tctl in millidegrees C. Signed: with the range bit set a cold chip is < 0. */
+static inline int32_t
+smn_tctl_mdeg(uint32_t raw)
+{
+    int32_t m = (int32_t)(((raw >> SMN_TCTL_SHIFT) & SMN_TCTL_MASK) * 125u);
+    if (raw & SMN_TCTL_RANGE_SEL) {
+        m -= SMN_TCTL_RANGE_MDEG;
+    }
+    return m;
+}
 
 #endif /* ZEN_MSR_H */

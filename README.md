@@ -28,7 +28,7 @@ Ryzen 7 5800H (Cezanne), Hackintosh на OpenCore.
 
 | Путь | Что это |
 |---|---|
-| `kext/` | **v0.1 «глаза»**: read-only kext. Читает CPPC, P-state и Tctl, публикует в IORegistry |
+| `kext/` | **v0.1 «глаза»**: read-only kext. Читает CPPC, P-state, APERF/MPERF/TSC и Tctl, публикует в IORegistry |
 | `tools/ryzenstat.c` | Консольная читалка: таблица по всем ядрам, без root |
 | `sim/policy_sim.py` | Модель политики: тепловой RC-контур, задержка SMU, сравнение режимов |
 | `docs/TZ.md` | Полное ТЗ: физика, архитектура, выходной порт, этапы, критерии приёмки |
@@ -43,11 +43,18 @@ Ryzen 7 5800H (Cezanne), Hackintosh на OpenCore.
 
 - `CPPC_CAP1 / ENABLE / CAP2 / REQ / STATUS` (`0xC00102B0..B4`)
 - текущий P-state (`0xC0010063`) и его определение (`0xC0010064 + n`)
-- Tctl через SMN (`0x00059800`, host bridge `0:0.0`, index/data `0x60/0x64`)
+- `MPERF/APERF` (`0xE7/0xE8`) и TSC: из них считаются C0-резиденция и эффективная частота
+- Tctl через SMN (`0x00059800`, host bridge `0:0.0`, index/data `0x60/0x64`), с учётом бита 19
+  (`CUR_TEMP_RANGE_SEL`, −49 °C)
 
 Безопасность: каждый MSR читается через `rdmsr_carefully()` — несуществующий MSR возвращает
 ошибку, а не панику. CPPC трогается только если CPUID Fn8000_0008 EBX[27] это разрешает.
-Boot-arg `ryzenplatform=0` не даёт kext'у стартовать.
+Boot-arg `ryzenplatform=0` (или флаг `-ryzenpmoff`) не даёт kext'у стартовать.
+
+Единственная «запись» — в индексный регистр SMN (`0x60`), без неё SMN не прочитать. SMN
+index/data делится с другими kext'ами (`SMCAMDProcessor` и т.п.) без общего лока: свои обращения
+kext сериализует, чужое вмешательство ловит повторным чтением индекса и считает в `smn.retries`.
+`ryzenstat` печатает предупреждение, если счётчик не нулевой.
 
 ## Сборка
 
@@ -78,11 +85,42 @@ cp -R build/run/RyzenPlatform.kext /Volumes/EFI/EFI/OC/Kexts/
 
 ```bash
 tools/ryzenstat          # один семпл
-tools/ryzenstat -w 5     # пять подряд
+tools/ryzenstat -w 5     # пять подряд (C0% и effMHz появляются со второго)
 ```
 
 Печатает по каждому потоку: `cap1` (low/nl/nom/high), `req` (min/max/desired/epp), статус CPPC,
-P-state, FID/DID → МГц, и Tctl.
+P-state, FID/DID → МГц, **C0%** и **effMHz**, и Tctl.
+
+Как читать:
+
+- **C0%** = ΔMPERF/ΔTSC — доля времени, когда ядро не спит. **В простое он должен быть близок к
+  нулю.** Если высокий, ядра не засыпают, и никакая политика частот нагрев не вылечит: причину
+  надо искать в idle-цикле, AMD Vanilla или EC. Проверяй это первым.
+- **effMHz** = TSC·ΔAPERF/ΔMPERF — реальная частота, пока ядро бодрствует. Нужен `hw.tscfrequency`;
+  на Hackintosh он бывает неверным, поэтому сверяй с колонкой `MHz` (из P-state).
+- **Tctl** с пометкой `range bit set` — применено −49 °C. Сырое значение лежит в `temp.raw`
+  (`ioreg -l | grep temp.raw`); сверь с `k10temp`/`SMCAMDProcessor`, прежде чем верить цифре.
+- `cppc.enabled` меньше числа ядер или `cap1` из нулей — CPPC на этой машине не работает, и весь
+  актуатор бессмыслен: останавливаться и разбираться, а не писать дальше.
+
+## Симулятор
+
+```bash
+python3 sim/policy_sim.py                      # сценарий по умолчанию
+python3 sim/policy_sim.py --click-mean 6       # редкие клики = больше холодных стартов
+python3 sim/policy_sim.py --observe-ms 8       # как быстро демон без предиктора видит кадр
+python3 sim/policy_sim.py --sustained nominal  # цена «экономии» на компиляции
+```
+
+Что он честно показывает (модель, а не замер; допущения вынесены в `Params`):
+
+- Колонка **`1st ms` / `1st miss%`** — первый кадр после простоя. Именно ради него нужен
+  предиктор; общий p95 эффект размывает.
+- Предиктор — **страховка**, не магия: при наблюдении кадра за 4 мс он даёт 2 мс вместо 6 мс на
+  первый кадр, при 8 мс спасает от промаха дедлайна 120 Гц, при мгновенном наблюдении не нужен.
+  Цена — около +1.7 Вт в среднем. Реальный `frame_observe_ms` надо измерить.
+- Компиляция: `SUSTAINED = highest` (потолок ставит PPT) укладывается в критерий «≤10% от max»,
+  `nominal` — нет (+36% времени за ~6% энергии).
 
 ## Три узла
 
@@ -104,7 +142,10 @@ P-state, FID/DID → МГц, и Tctl.
 
 - [x] Замерить baseline на живой машине.
 - [x] Kext «глаза»: CPPC read, P-state, Tctl, boot-arg kill switch.
-- [ ] Посмотреть, что реально отдаёт SMU: `cppc.enabled`, границы `cap1`.
+- [x] Kext читает APERF/MPERF/TSC (C0% и effMHz в `ryzenstat`), бит 19 Tctl, SMN под защитой.
+- [ ] **Первым делом на железе:** `ryzenstat -w 5` в простое: C0% по ядрам, `cppc.enabled`, границы
+      `cap1`, `smn.retries`, сверка `temp.raw`. Это решает, имеет ли смысл всё остальное.
+- [ ] Контрольный опыт: записать `CPPC_REQ` на одном ядре и увидеть сдвиг effMHz (APERF/MPERF).
 - [ ] Kext-актуатор: запись `CPPC_REQ`, verify read-back, watchdog.
 - [ ] Демон в shadow-режиме: только логировать решения, ничего не писать.
 - [ ] Замкнутый контур, тепловой guard, sleep/wake.

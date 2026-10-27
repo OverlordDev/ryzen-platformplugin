@@ -21,6 +21,7 @@ public:
 private:
     void onTimer();
     void sample();
+    void teardown();
 
     IOWorkLoop         *fWorkLoop = nullptr;
     IOTimerEventSource *fTimer    = nullptr;

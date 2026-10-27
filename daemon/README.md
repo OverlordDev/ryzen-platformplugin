@@ -49,7 +49,7 @@ HID event / timer 1 ms / NSWorkspace notification
 - `IDLE_READY` — preferred `nominal`, остальные `lowest`, 0–500 мс после ввода.
 - `BURST` — preferred + sibling `highest`, 2–4 мс, EPP 0.
 - `INTERACTIVE` — preferred `highest`, ещё 2 ядра `nominal`, EPP 32.
-- `SUSTAINED` — все `nominal`, EPP 128.
+- `SUSTAINED` — все `highest` (потолок ставит PPT), EPP 128.
 - `THERMAL_GUARD` — cap/низкие частоты, приоритет выше всего.
 
 Псевдокод:
@@ -103,8 +103,8 @@ constraint 0.5 мс) или с высоким QoS. Проверить, что э
 
 - считать `Decision` на каждом тике;
 - писать в CSV: `timestamp, state, urgency, cores, perf, epp, temp, power, frame_ms, actual_freq`;
-- ничего не отправлять в kext (кроме `heartbeat`, чтобы watchdog не сработал? Нет: в shadow
-  kext вообще не нужен, или нужен только для чтения состояния).
+- ничего не отправлять в kext: в shadow-режиме watchdog не вооружён (нет override — нечего
+  откатывать), поэтому `heartbeat` не нужен; kext используется только для чтения состояния.
 - Сравнить решения с фактическим поведением: где политика хотела буст, а кадр всё равно
   опоздал; где хотела сон, а система дёргалась.
 
