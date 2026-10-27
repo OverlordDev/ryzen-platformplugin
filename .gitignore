@@ -1,0 +1,15 @@
+# build output
+build/
+*.o
+*.dSYM/
+
+# compiled tools
+tools/ryzenstat
+
+# python
+__pycache__/
+*.pyc
+
+# macos noise
+.DS_Store
+._*
