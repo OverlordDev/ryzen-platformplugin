@@ -28,7 +28,10 @@ Ryzen 7 5800H (Cezanne), Hackintosh на OpenCore.
 
 | Путь | Что это |
 |---|---|
-| `kext/` | **v0.1 «глаза»**: read-only kext. Читает CPPC, P-state, APERF/MPERF/TSC и Tctl, публикует в IORegistry |
+| `kext/` | **v0.2**: «глаза» (CPPC, P-state, APERF/MPERF/TSC, Tctl в IORegistry) **+ актуатор** `CPPC_REQ` (user client, watchdog, thermal guard). Запись выключена, пока нет boot-arg `ryzenplatform_write=1` |
+| `daemon/ryzend.c` | Демон: сигналы (HID, WindowServer, загрузка), политика, shadow/apply, `--poke`, сон/пробуждение |
+| `kext/test/` | Хост-тесты безопасности актуатора: `make test` |
+| `docs/HANDOFF.md` | **Читать первым при сборке**: что проверено, что нет, где сломается, порядок bring-up |
 | `tools/ryzenstat.c` | Консольная читалка: таблица по всем ядрам, без root |
 | `sim/policy_sim.py` | Модель политики: тепловой RC-контур, задержка SMU, сравнение режимов |
 | `docs/TZ.md` | Полное ТЗ: физика, архитектура, выходной порт, этапы, критерии приёмки |
@@ -56,11 +59,19 @@ index/data делится с другими kext'ами (`SMCAMDProcessor` и т
 kext сериализует, чужое вмешательство ловит повторным чтением индекса и считает в `smn.retries`.
 `ryzenstat` печатает предупреждение, если счётчик не нулевой.
 
+> **Статус v0.2:** актуатор и демон написаны по памяти и **не собирались на macOS и не
+> запускались на железе**. Логика безопасности актуатора проверена хост-тестами (`make test`).
+> Всё остальное: `docs/HANDOFF.md`.
+
 ## Сборка
 
 ```bash
-cd kext && make            # -> build/run/RyzenPlatform.kext
-cd ../tools && make        # -> tools/ryzenstat
+make              # kext + tools/ryzenstat + daemon/ryzend
+make test         # хост-тесты актуатора (ядро не нужно)
+# или по отдельности:
+cd kext && make   # -> build/run/RyzenPlatform.kext
+cd tools && make  # -> tools/ryzenstat
+cd daemon && make # -> daemon/ryzend
 ```
 
 Нужны Command Line Tools (или Xcode). Xcode-проект не нужен, всё собирается Makefile'ом.
@@ -146,8 +157,13 @@ python3 sim/policy_sim.py --sustained nominal  # цена «экономии» �
 - [ ] **Первым делом на железе:** `ryzenstat -w 5` в простое: C0% по ядрам, `cppc.enabled`, границы
       `cap1`, `smn.retries`, сверка `temp.raw`. Это решает, имеет ли смысл всё остальное.
 - [ ] Контрольный опыт: записать `CPPC_REQ` на одном ядре и увидеть сдвиг effMHz (APERF/MPERF).
-- [ ] Kext-актуатор: запись `CPPC_REQ`, verify read-back, watchdog.
-- [ ] Демон в shadow-режиме: только логировать решения, ничего не писать.
+- [x] Kext-актуатор написан: запись `CPPC_REQ`, read-back, откат к значению прошивки, watchdog,
+      thermal guard, lockout (логика проверена хост-тестами; на macOS не собиралась).
+- [x] Демон `ryzend` написан: shadow / apply / `--poke` / сон-пробуждение (не собирался на macOS).
+- [ ] Собрать на macOS и починить расхождения API: `docs/HANDOFF.md` §3.
+- [ ] Контрольный опыт `ryzend --poke`: двигается ли частота одного ядра. **Если нет, проект
+      в нынешнем виде бессмыслен.**
+- [ ] Демон в shadow-режиме на живой машине: решения похожи на здравый смысл.
 - [ ] Замкнутый контур, тепловой guard, sleep/wake.
 
 Подробности — в `docs/TZ.md`.

@@ -13,3 +13,9 @@ __pycache__/
 # macos noise
 .DS_Store
 ._*
+
+# daemon binary
+daemon/ryzend
+
+# host test binary
+kext/test/acttest

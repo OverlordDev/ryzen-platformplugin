@@ -1,7 +1,10 @@
 /*
- * RyzenPlatform.cpp - v0.1 "eyes".
+ * RyzenPlatform.cpp - v0.2: sampler ("eyes") + service glue for the actuator.
  *
- * What it does: every second, on every CPU, reads the CPPC MSRs, the current
+ * The CPPC writer lives in Actuator.cpp and is off unless the machine booted
+ * with ryzenplatform_write=1. This file stays read-only by itself.
+ *
+ * What the sampler does: every second, on every CPU, reads the CPPC MSRs, the current
  * P-state and the APERF/MPERF/TSC counters, reads Tctl from the SMU through
  * SMN, and publishes the result as IORegistry properties. It never writes an
  * MSR and never touches the SMU mailbox. The only write it makes at all is to
@@ -26,9 +29,12 @@
 #include <IOKit/IOService.h>
 #include <IOKit/IOLib.h>
 #include <IOKit/IOLocks.h>
+#include <IOKit/IOKitKeys.h>
 #include <IOKit/IOTimerEventSource.h>
 #include <IOKit/IOWorkLoop.h>
+#include <IOKit/IOUserClient.h>
 #include <IOKit/pci/IOPCIDevice.h>
+
 #include <pexpert/pexpert.h>
 #include <i386/proc_reg.h>
 #include <libkern/libkern.h>
@@ -36,10 +42,14 @@
 
 #include "ZenMsr.h"
 #include "KernelDecls.hpp"
+#include "MsrIo.hpp"
+#include "Actuator.hpp"
 #include "RyzenPlatform.hpp"
+#include "RyzenUserClient.hpp"
 
 #define kMaxCpus        64
 #define kSamplePeriodMs 1000
+#define kWatchdogTickMs 50
 #define kSmnAttempts    3
 
 /* ---------------------------------------------------------------- globals */
@@ -141,18 +151,15 @@ disabledByBootArg(void)
     return false;
 }
 
-/* --------------------------------------------------------------- msr reads */
-
-static inline bool
-readMsr(uint32_t msr, uint64_t *value)
+/* Writes are opt-in. Without this the kext cannot change a single register. */
+static bool
+writeEnabledByBootArg(void)
 {
-    uint32_t lo = 0, hi = 0;
-    if (rdmsr_carefully(msr, &lo, &hi) != 0) {
-        return false;
-    }
-    *value = ((uint64_t)hi << 32) | lo;
-    return true;
+    int v = 0;
+    return PE_parse_boot_argn("ryzenplatform_write", &v, sizeof(v)) && v == 1;
 }
+
+/* --------------------------------------------------------------- msr reads */
 
 static void
 countOneCpu(void * /*arg*/)
@@ -169,7 +176,7 @@ static bool
 countCpus(void)
 {
     bzero((void *)gSeen, sizeof(gSeen));
-    mp_rendezvous_no_intrs(countOneCpu, NULL);
+    ryzenRendezvous(countOneCpu);
 
     uint32_t n = 0;
     while (n < kMaxCpus && gSeen[n]) {
@@ -280,19 +287,18 @@ smnRead(uint32_t address, uint32_t *value)
         return false;
     }
 
-    if (!gHostBridge) {
-        gHostBridge = findHostBridge();
-        if (!gHostBridge) {
-            return false;
-        }
-        IOLog("RyzenPlatform: SMN host bridge %s\n",
-              gHostBridge->getName());
-    }
-
     bool ok = false;
 
+    /* The lock also covers the lazy host-bridge lookup: the sampler and the
+     * actuator (via ryzenReadTctl) can both be the first caller. */
     IOLockLock(gSmnLock);
-    for (int attempt = 0; attempt < kSmnAttempts; attempt++) {
+    if (!gHostBridge) {
+        gHostBridge = findHostBridge();
+        if (gHostBridge) {
+            IOLog("RyzenPlatform: SMN host bridge %s\n", gHostBridge->getName());
+        }
+    }
+    for (int attempt = 0; gHostBridge && attempt < kSmnAttempts; attempt++) {
         gHostBridge->configWrite32((UInt8)0x60, address);
         uint32_t v = gHostBridge->configRead32((UInt8)0x64);
         if (gHostBridge->configRead32((UInt8)0x60) == address) {
@@ -305,6 +311,41 @@ smnRead(uint32_t address, uint32_t *value)
     IOLockUnlock(gSmnLock);
 
     return ok;
+}
+
+bool
+ryzenReadTctl(int32_t *mdeg)
+{
+    uint32_t raw = 0;
+    if (!smnRead(SMN_THM_TCON_CUR_TMP, &raw) || raw == 0xFFFFFFFFu) {
+        return false;
+    }
+    int32_t m = smn_tctl_mdeg(raw);
+    /* Outside this window the read is garbage (floating bus, wrong offset). */
+    if (m < -20000 || m > 130000) {
+        return false;
+    }
+    *mdeg = m;
+    return true;
+}
+
+uint32_t
+ryzenSmnRetries(void)
+{
+    return gSmnRetries;
+}
+
+bool
+ryzenGetSample(uint32_t cpu, RyzenCpuSample *out)
+{
+    if (cpu >= gCpuCount) {
+        return false;
+    }
+    const CpuSnapshot *s = &gSnap[cpu];     /* a torn read here is harmless: it is informational */
+    out->cap1 = s->cap1;       out->enable = s->enable;   out->cap2 = s->cap2;
+    out->req  = s->req;        out->status = s->status;
+    out->pstate = s->pstate;   out->pstateDef = s->pstateDef;
+    return true;
 }
 
 /* ---------------------------------------------------------------- publish  */
@@ -339,15 +380,23 @@ com_illia_RyzenPlatform::start(IOService *provider)
     gCpuCount      = 0;
     bzero(gSnap, sizeof(gSnap));
 
+    bool writeOn = writeEnabledByBootArg();
+    if (!actInit(gCppcSupported, writeOn)) {
+        return false;
+    }
+
     /* One rendezvous just to learn how many CPUs we actually run on. */
     if (!countCpus() || gCpuCount > kMaxCpus) {
         IOLog("RyzenPlatform: bad cpu count %u, giving up\n", gCpuCount);
+        teardown();
         return false;
     }
+    actSetCpuCount(gCpuCount);
 
     gSmnLock    = IOLockAlloc();
     gSmnRetries = 0;
     if (!gSmnLock) {
+        teardown();
         return false;
     }
 
@@ -365,7 +414,30 @@ com_illia_RyzenPlatform::start(IOService *provider)
         return false;
     }
 
-    setProperty("kext.version", "0.1.0");
+    fWatchTimer = IOTimerEventSource::timerEventSource(
+        this, OSMemberFunctionCast(IOTimerEventSource::Action, this,
+                                   &com_illia_RyzenPlatform::onWatchdog));
+    if (!fWatchTimer || fWorkLoop->addEventSource(fWatchTimer) != kIOReturnSuccess) {
+        teardown();
+        return false;
+    }
+
+#if RYZEN_ENABLE_PM
+    static IOPMPowerState powerStates[2] = {
+        { 1, 0,           0,           0,           0, 0, 0, 0, 0, 0, 0, 0 },
+        { 1, kIOPMPowerOn, kIOPMPowerOn, kIOPMPowerOn, 0, 0, 0, 0, 0, 0, 0, 0 },
+    };
+    PMinit();
+    fPmInit = true;
+    provider->joinPMtree(this);
+    registerPowerDriver(this, powerStates, 2);
+#endif
+
+    setProperty("kext.version", "0.2.0");
+    setProperty("write.enabled", writeOn ? kOSBooleanTrue : kOSBooleanFalse);
+    if (writeOn) {
+        IOLog("RyzenPlatform: WRITES ARE ENABLED (ryzenplatform_write=1)\n");
+    }
     setProperty("cppc.supported",
                 gCppcSupported ? kOSBooleanTrue : kOSBooleanFalse);
     setProperty("aperf.supported",
@@ -385,6 +457,15 @@ com_illia_RyzenPlatform::start(IOService *provider)
 void
 com_illia_RyzenPlatform::teardown()
 {
+    /* Timers first, so nothing can race the actuator while it restores the CPUs. */
+    if (fWatchTimer) {
+        fWatchTimer->cancelTimeout();
+        if (fWorkLoop) {
+            fWorkLoop->removeEventSource(fWatchTimer);
+        }
+        fWatchTimer->release();
+        fWatchTimer = NULL;
+    }
     if (fTimer) {
         fTimer->cancelTimeout();
         if (fWorkLoop) {
@@ -397,6 +478,8 @@ com_illia_RyzenPlatform::teardown()
         fWorkLoop->release();
         fWorkLoop = NULL;
     }
+    /* Hand the CPUs back to the firmware before anything else goes away. */
+    actShutdown();
     if (gHostBridge) {
         gHostBridge->release();
         gHostBridge = NULL;
@@ -411,8 +494,87 @@ void
 com_illia_RyzenPlatform::stop(IOService *provider)
 {
     teardown();
+#if RYZEN_ENABLE_PM
+    if (fPmInit) {
+        PMstop();
+        fPmInit = false;
+    }
+#endif
     super::stop(provider);
 }
+
+IOReturn
+com_illia_RyzenPlatform::newUserClient(task_t owningTask, void *securityID, UInt32 type,
+                                       OSDictionary *properties, IOUserClient **handler)
+{
+    if (type != 0 || !handler) {
+        return kIOReturnBadArgument;
+    }
+    /* Root only: this door ends in a wrmsr. */
+    if (IOUserClient::clientHasPrivilege(securityID, kIOClientPrivilegeAdministrator) != kIOReturnSuccess) {
+        return kIOReturnNotPrivileged;
+    }
+    if (fClientOpen) {
+        return kIOReturnExclusiveAccess;
+    }
+
+    com_illia_RyzenUserClient *uc = OSTypeAlloc(com_illia_RyzenUserClient);
+    if (!uc) {
+        return kIOReturnNoMemory;
+    }
+    if (!uc->initWithTask(owningTask, securityID, type, properties)) {
+        uc->release();
+        return kIOReturnBadArgument;
+    }
+    if (!uc->attach(this)) {
+        uc->release();
+        return kIOReturnInternalError;
+    }
+    if (!uc->start(this)) {
+        uc->detach(this);
+        uc->release();
+        return kIOReturnInternalError;
+    }
+    fClientOpen = true;
+    *handler = uc;
+    return kIOReturnSuccess;
+}
+
+void
+com_illia_RyzenPlatform::clientClosed(void)
+{
+    fClientOpen = false;
+}
+
+void
+com_illia_RyzenPlatform::kickWatchdog(void)
+{
+    if (fWatchTimer && actNeedsTick()) {
+        fWatchTimer->setTimeoutMS(kWatchdogTickMs);
+    }
+}
+
+void
+com_illia_RyzenPlatform::onWatchdog()
+{
+    actTick();
+    if (fWatchTimer && actNeedsTick()) {
+        fWatchTimer->setTimeoutMS(kWatchdogTickMs);
+    }
+}
+
+#if RYZEN_ENABLE_PM
+IOReturn
+com_illia_RyzenPlatform::setPowerState(unsigned long state, IOService *)
+{
+    if (state == 0) {
+        actPrepareForSleep();
+    } else {
+        actWake();
+    }
+    return IOPMAckImplied;
+}
+#endif
 
 void
 com_illia_RyzenPlatform::free()
@@ -432,7 +594,7 @@ com_illia_RyzenPlatform::onTimer()
 void
 com_illia_RyzenPlatform::sample()
 {
-    mp_rendezvous_no_intrs(sampleOneCpu, NULL);
+    ryzenRendezvous(sampleOneCpu);
 
     for (uint32_t i = 0; i < gCpuCount; i++) {
         gOut64[0][i] = gSnap[i].cap1;

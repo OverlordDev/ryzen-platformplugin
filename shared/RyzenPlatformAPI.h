@@ -17,7 +17,19 @@
 extern "C" {
 #endif
 
-#define RYZEN_PLATFORM_ABI_VERSION 1u
+/*
+ * Terminology: every "core" field in this ABI is a LOGICAL CPU index, i.e. the
+ * value of cpu_number() inside the kext (0..core_count-1). With SMT on, two
+ * consecutive indices are usually the two threads of one physical core, but the
+ * kext does not promise that; the daemon owns that assumption (--smt-stride).
+ *
+ * How to talk to the kext (IOServiceOpen type 0, root only, one client at a time):
+ *   - getters take ONE scalar input: the client's abi_version, plus the core
+ *     index as a SECOND scalar for readState;
+ *   - applyPerf and heartbeat take a struct input that carries abi_version;
+ *   - all structs are returned/accepted at EXACTLY sizeof() of this header.
+ */
+#define RYZEN_PLATFORM_ABI_VERSION 2u
 #define RYZEN_PLATFORM_MAX_CORES 32u
 #define RYZEN_PLATFORM_ERROR_MSG_LEN 128u
 
@@ -32,6 +44,8 @@ typedef enum {
     kRyzenSelectorResetAuto     = 3,
     kRyzenSelectorHeartbeat     = 4,
     kRyzenSelectorGetLastError  = 5,
+    kRyzenSelectorGetStatus     = 6,
+    kRyzenSelectorCount         = 7,
 } ryzen_selector_t;
 
 /* ------------------------------------------------------------------------- */
@@ -46,6 +60,8 @@ enum {
     RYZEN_FLAG_BOOT_ARG_DISABLED= 1u << 4,
     RYZEN_FLAG_OVERRIDE_ACTIVE  = 1u << 5,
     RYZEN_FLAG_SLEEPING         = 1u << 6,
+    RYZEN_FLAG_WRITE_ENABLED    = 1u << 7,   /* boot-arg ryzenplatform_write=1 was given */
+    RYZEN_FLAG_LOCKOUT          = 1u << 8,   /* kext refuses applyPerf until resetAuto */
 };
 
 /* ------------------------------------------------------------------------- */
@@ -61,6 +77,8 @@ typedef enum {
     RYZEN_E_THERMAL      = 5,
     RYZEN_E_WATCHDOG     = 6,
     RYZEN_E_INTERNAL     = 7,
+    RYZEN_E_DISABLED     = 8,   /* writes not enabled: boot with ryzenplatform_write=1 */
+    RYZEN_E_LOCKOUT      = 9,   /* a safety stop is latched; call resetAuto once it is cleared */
 } ryzen_error_code_t;
 
 /* ------------------------------------------------------------------------- */
@@ -136,6 +154,26 @@ typedef struct {
     uint32_t flags;
     uint32_t reserved[3];
 } ryzen_heartbeat_t;
+
+/* ------------------------------------------------------------------------- */
+/* Status (everything the daemon needs for its own safety checks)             */
+/* ------------------------------------------------------------------------- */
+
+#define RYZEN_TEMP_UNKNOWN (-2147483647 - 1)   /* INT32_MIN, spelled out: no <limits.h> in the kernel */
+
+typedef struct {
+    uint32_t abi_version;
+    uint32_t struct_size;
+    uint32_t flags;               /* RYZEN_FLAG_* */
+    uint32_t guard_level;         /* 0 none, 1 cap at nominal, 2 all lowest, 3 reset + lockout */
+    int32_t  tctl_millic;         /* RYZEN_TEMP_UNKNOWN if the sensor did not answer */
+    uint32_t heartbeat_age_ms;    /* since the last heartbeat; meaningful while an override is active */
+    uint32_t watchdog_resets;     /* times the kext reverted on its own because heartbeats stopped */
+    uint32_t readback_failures;   /* writes that did not read back; any non-zero value is a red flag */
+    uint32_t smn_retries;         /* foreign SMN index/data interleaves caught */
+    uint32_t cpu_count;
+    uint32_t reserved[4];
+} ryzen_status_t;
 
 /* ------------------------------------------------------------------------- */
 /* Last error                                                                 */

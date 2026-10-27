@@ -1,11 +1,19 @@
 # kext: карта классов и что нужно проверить на железе
 
-> Это дизайн-карта актуатора. **Что уже есть в коде (v0.1, `Source/`)**: read-only сервис
-> `com_illia_RyzenPlatform` — CPPC/P-state/APERF/MPERF/TSC по каждому CPU и Tctl через SMN,
-> публикация в IORegistry, boot-arg kill switch. Классы `RyzenCPPC`, `RyzenWatchdog`,
-> `RyzenUserClient` и запись в MSR — ещё нет; они пишутся после этапа 0 (замеры) и после
-> проверки API на конкретной сборке macOS. Ниже — контракт ответственности, а не
-> «скомпилируется как есть».
+> Это дизайн-карта. **Что уже есть в коде (v0.2, `Source/`)**, написано по памяти и не
+> собиралось на macOS (см. `docs/HANDOFF.md`):
+>
+> | Файл | Роль |
+> |---|---|
+> | `RyzenPlatform.cpp/.hpp` | сервис `com_illia_RyzenPlatform`: сэмплер 1 Гц (CPPC, P-state, APERF/MPERF/TSC, Tctl), kill switch, таймеры, `newUserClient` |
+> | `Actuator.cpp/.hpp` | **единственный** код, пишущий `CPPC_REQ`: clamp, read-back, откат к значению прошивки, watchdog 150 мс, TTL, thermal guard, lockout, сон |
+> | `RyzenUserClient.cpp/.hpp` | дверь для демона (root, один клиент), диспетчер селекторов из `shared/RyzenPlatformAPI.h` |
+> | `MsrIo.hpp` | `readMsr/writeMsr` через `*_carefully` + сериализованный rendezvous |
+> | `test/` | хост-тесты логики актуатора (`make -C kext/test`), без ядра |
+>
+> Раздел «Классы» ниже описывает исходный замысел; реальное разбиение файлов — таблица выше
+> (`RyzenCPPC` и `RyzenWatchdog` слиты в `Actuator`). Запись в MSR выключена, пока машина не
+> загружена с `ryzenplatform_write=1`.
 
 ## Зачем вообще kext
 
@@ -44,7 +52,8 @@
   - read-back; при расхождении — `RYZEN_E_READBACK`, отключить override;
   - TTL: если `ttl_ms > 0`, по истечении вернуть auto для этого ядра.
 - `resetAuto()`:
-  - `max = highest`, `min = lowest`, `desired = nominal`, `EPP = 128`;
+  - вернуть `CPPC_REQ` **ровно к значению, которое было до нас** (`origReq`, запоминается по CPU
+    перед первой записью), а не к придуманному «balanced»;
   - снять per-core override, остановить TTL-таймеры.
 - `setCppcEnabled(bool)`:
   - `MSR_AMD_CPPC_ENABLE` bit 0; проверить `CPPC_STATUS`.

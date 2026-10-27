@@ -23,9 +23,13 @@
 #define CPPC_CAP1_NOMINAL(x)    ((uint32_t)(((x) >> 16) & 0xFFu))
 #define CPPC_CAP1_HIGHEST(x)    ((uint32_t)(((x) >> 24) & 0xFFu))
 
-/* REQ: min / max / desired perf + energy performance preference. */
-#define CPPC_REQ_MIN(x)         ((uint32_t)((x)       & 0xFFu))
-#define CPPC_REQ_MAX(x)         ((uint32_t)(((x) >> 8)  & 0xFFu))
+/* REQ: max / min / desired perf + energy performance preference.
+ * Same layout as Linux amd-pstate (AMD_CPPC_{MAX,MIN,DES,EPP}_PERF_MASK):
+ *   7:0 max_perf   15:8 min_perf   23:16 desired_perf (0 = let the SMU pick)   31:24 EPP.
+ * v0.1 had max and min swapped; it only mislabelled ryzenstat output, but
+ * writing with the swapped layout would invert every request. */
+#define CPPC_REQ_MAX(x)         ((uint32_t)((x)       & 0xFFu))
+#define CPPC_REQ_MIN(x)         ((uint32_t)(((x) >> 8)  & 0xFFu))
 #define CPPC_REQ_DESIRED(x)     ((uint32_t)(((x) >> 16) & 0xFFu))
 #define CPPC_REQ_EPP(x)         ((uint32_t)(((x) >> 24) & 0xFFu))
 

@@ -200,8 +200,11 @@ main(int argc, char **argv)
     }
 
     printf("RyzenPlatform shadow reader\n");
-    printf("  CPUs: %u    CPPC advertised by CPUID: %s\n", nCpu, yesno(cppcSupported));
-    printf("  No MSR is written. Values come from the SMU via rdmsr.\n");
+    int writeOn = 0;
+    getBool("write.enabled", &writeOn);
+    printf("  CPUs: %u    CPPC advertised by CPUID: %s    kext writes: %s\n", nCpu,
+           yesno(cppcSupported), writeOn ? "ENABLED (ryzenplatform_write=1)" : "off");
+    printf("  ryzenstat itself never writes. Values come from the SMU via rdmsr.\n");
     printf("  TSC: %s\n\n", tsc > 0.0 ? "known" : "unknown, effMHz unavailable");
 
     for (int iter = 0; iter < watch; iter++) {
@@ -282,7 +285,8 @@ main(int argc, char **argv)
                        i,
                        (unsigned)(c1 & 0xFF), (unsigned)((c1 >> 8) & 0xFF),
                        (unsigned)((c1 >> 16) & 0xFF), (unsigned)((c1 >> 24) & 0xFF),
-                       (unsigned)(rq & 0xFF), (unsigned)((rq >> 8) & 0xFF),
+                       /* REQ: 7:0 max, 15:8 min, 23:16 desired, 31:24 EPP (printed min/max/des/epp) */
+                       (unsigned)((rq >> 8) & 0xFF), (unsigned)(rq & 0xFF),
                        (unsigned)((rq >> 16) & 0xFF), (unsigned)((rq >> 24) & 0xFF),
                        (unsigned)(en & 0xFF),
                        (st & 1) ? "on " : "off",

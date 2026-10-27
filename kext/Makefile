@@ -22,7 +22,7 @@ COMMON  := -arch x86_64 -isysroot $(SDK) -mmacosx-version-min=10.15 \
            -mkernel -nostdinc -nostdlibinc \
            -I$(KFW)/Headers -I$(KFW)/PrivateHeaders \
            -DKERNEL -DKERNEL_PRIVATE -DDRIVER_PRIVATE -DAPPLE -DNeXT \
-           -Wall -Wextra $(OPT)
+           -I../shared -Wall -Wextra $(OPT)
 
 CXXFLAGS := $(COMMON) -std=gnu++17 -fapple-kext -fno-exceptions -fno-rtti -fno-builtin
 CFLAGS   := $(COMMON) -fno-builtin
